@@ -1,0 +1,131 @@
+"""Reading whatever shape the data already has."""
+
+from __future__ import annotations
+
+import json
+
+import pytest
+
+from edgecheck.loaders import ColumnMap, load, read_rows
+
+
+def _csv(tmp_path, header, rows, name="t.csv"):
+    p = tmp_path / name
+    lines = [",".join(header)] + [",".join(str(c) for c in r) for r in rows]
+    p.write_text("\n".join(lines) + "\n")
+    return p
+
+
+def test_reads_csv(tmp_path):
+    p = _csv(tmp_path, ["pnl", "fee"], [[1.5, 0.1], [-2.0, 0.1]])
+    ts = load(p, ColumnMap(pnl="pnl", cost="fee"))
+    assert [t.pnl for t in ts] == [1.5, -2.0]
+    assert [t.cost for t in ts] == [0.1, 0.1]
+
+
+def test_reads_jsonl(tmp_path):
+    p = tmp_path / "t.jsonl"
+    p.write_text("\n".join(json.dumps({"pnl": v}) for v in (1.0, 2.0)) + "\n")
+    assert [t.pnl for t in load(p, ColumnMap())] == [1.0, 2.0]
+
+
+def test_a_partial_final_line_is_tolerated(tmp_path):
+    """Live logs get read while they are being appended to."""
+    p = tmp_path / "t.jsonl"
+    p.write_text('{"pnl": 1.0}\n{"pnl": 2.0}\n{"pnl": 3.0')     # truncated
+    assert len(load(p, ColumnMap())) == 2
+
+
+def test_json_extension_holding_a_list(tmp_path):
+    p = tmp_path / "t.json"
+    p.write_text(json.dumps([{"pnl": 1.0}, {"pnl": 2.0}]))
+    assert len(load(p, ColumnMap())) == 2
+
+
+def test_rows_without_a_pnl_are_skipped_not_zeroed(tmp_path):
+    """A missing result is not a result of zero."""
+    p = _csv(tmp_path, ["pnl"], [[1.0], [""], [3.0]])
+    assert [t.pnl for t in load(p, ColumnMap())] == [1.0, 3.0]
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("true", True), ("TRUE", True), ("1", True), ("yes", True), ("won", True),
+    ("false", False), ("0", False), ("no", False), ("", None),
+])
+def test_won_accepts_the_spellings_people_actually_use(tmp_path, raw, expected):
+    p = _csv(tmp_path, ["pnl", "won"], [[1.0, raw]])
+    assert load(p, ColumnMap(won="won"))[0].won is expected
+
+
+def test_p_yes_is_flipped_for_a_no_side_trade(tmp_path):
+    """Storing P(YES) and reading it as P(side taken) scores a no-side trade
+    against its own complement. Invisible until a no-side trade appears."""
+    p = _csv(tmp_path, ["pnl", "fair", "side"], [[1.0, 0.70, "no"], [1.0, 0.70, "yes"]])
+    m = ColumnMap(predicted="fair", side="side", predicted_is_yes=True)
+    ts = load(p, m)
+    assert ts[0].predicted == pytest.approx(0.30)
+    assert ts[1].predicted == pytest.approx(0.70)
+
+
+def test_p_side_is_left_alone_when_not_flagged(tmp_path):
+    p = _csv(tmp_path, ["pnl", "fair", "side"], [[1.0, 0.30, "no"]])
+    ts = load(p, ColumnMap(predicted="fair", side="side"))
+    assert ts[0].predicted == pytest.approx(0.30)
+
+
+def test_claimed_edge_scales_by_size(tmp_path):
+    p = _csv(tmp_path, ["pnl", "edge", "shares"], [[1.0, 0.05, 200]])
+    t = load(p, ColumnMap(claimed="edge", size="shares"))[0]
+    assert t.claimed_value == pytest.approx(10.0)
+
+
+def test_claimed_edge_without_size_is_per_unit(tmp_path):
+    p = _csv(tmp_path, ["pnl", "edge"], [[1.0, 0.05]])
+    assert load(p, ColumnMap(claimed="edge"))[0].claimed_value == pytest.approx(0.05)
+
+
+def test_paired_log_joins_entry_to_resolve(tmp_path):
+    p = tmp_path / "live.jsonl"
+    p.write_text("\n".join(json.dumps(r) for r in [
+        {"kind": "open", "id": "A", "fair": 0.8},
+        {"kind": "settle", "id": "A", "pnl": 1.5, "won": True},
+    ]) + "\n")
+    m = ColumnMap(kind="kind", entry_kind="open", resolve_kind="settle",
+                  key="id", predicted="fair", won="won")
+    ts = load(p, m)
+    assert len(ts) == 1
+    assert ts[0].pnl == 1.5 and ts[0].predicted == 0.8 and ts[0].won is True
+
+
+def test_repeated_keys_pair_in_order(tmp_path):
+    """Same market traded twice: the second resolve must not rebind to the
+    first entry and reuse its claimed edge."""
+    p = tmp_path / "live.jsonl"
+    p.write_text("\n".join(json.dumps(r) for r in [
+        {"kind": "open", "id": "SAME", "fair": 0.6},
+        {"kind": "open", "id": "SAME", "fair": 0.7},
+        {"kind": "settle", "id": "SAME", "pnl": 1.0},
+        {"kind": "settle", "id": "SAME", "pnl": -1.0},
+    ]) + "\n")
+    m = ColumnMap(kind="kind", entry_kind="open", resolve_kind="settle",
+                  key="id", predicted="fair")
+    ts = load(p, m)
+    assert [t.predicted for t in ts] == [0.6, 0.7]
+
+
+def test_an_unmatched_entry_is_not_counted(tmp_path):
+    """Open positions have no outcome yet and must not be scored."""
+    p = tmp_path / "live.jsonl"
+    p.write_text("\n".join(json.dumps(r) for r in [
+        {"kind": "open", "id": "A", "fair": 0.8},
+        {"kind": "open", "id": "B", "fair": 0.9},
+        {"kind": "settle", "id": "A", "pnl": 1.0},
+    ]) + "\n")
+    m = ColumnMap(kind="kind", entry_kind="open", resolve_kind="settle", key="id")
+    assert len(load(p, m)) == 1
+
+
+def test_read_rows_on_an_empty_file(tmp_path):
+    p = tmp_path / "empty.csv"
+    p.write_text("")
+    assert read_rows(p) == []
