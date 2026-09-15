@@ -11,6 +11,7 @@ verdict -- the exact shape of a strategy that is about to lose money slowly.
 from __future__ import annotations
 
 import math
+import random
 from dataclasses import dataclass
 
 Z95 = 1.959963985     # two-sided 95%
@@ -20,6 +21,11 @@ Z80 = 0.8416212336    # 80% power
 # Not a statistical constant -- a policy. The interval alone will happily call
 # three lucky coin flips significant.
 MIN_N_FOR_VERDICT = 30
+
+# When trades are clustered, the verdict counts clusters. Twenty-one is the
+# floor the maker forward test in crypto-bot pre-registered for calendar days;
+# it is still a policy, not a constant, and a plan file can raise it.
+MIN_CLUSTERS_FOR_VERDICT = 21
 
 # A bucket-level warning (overconfident, concentrated loss) is only raised when
 # the bucket sits at least this many standard errors from its null. Below it
@@ -58,7 +64,13 @@ def mean_sd(xs: list[float]) -> tuple[float, float]:
 
 @dataclass(frozen=True)
 class Expectancy:
-    """What a series of outcomes actually returned, and whether we can tell."""
+    """What a series of outcomes actually returned, and whether we can tell.
+
+    When `clusters` is set the interval is cluster-robust: trades that share a
+    cluster (a day, a market, a session) are one piece of evidence, not many,
+    and the standard error, the degrees of freedom and the verdict threshold
+    all count clusters rather than trades.
+    """
 
     n: int
     total: float
@@ -67,10 +79,21 @@ class Expectancy:
     se: float
     lo: float
     hi: float
+    clusters: int | None = None
+    min_n: int = MIN_N_FOR_VERDICT
+
+    @property
+    def units(self) -> int:
+        """What the verdict threshold is counted in: clusters if clustered."""
+        return self.clusters if self.clusters is not None else self.n
+
+    @property
+    def unit_name(self) -> str:
+        return "clusters" if self.clusters is not None else "resolved"
 
     @property
     def underpowered(self) -> bool:
-        return self.n < MIN_N_FOR_VERDICT
+        return self.units < self.min_n
 
     @property
     def distinguishable(self) -> bool:
@@ -83,23 +106,128 @@ class Expectancy:
     @property
     def verdict(self) -> str:
         if self.underpowered:
-            return f"NO VERDICT -- {self.n} resolved, need {MIN_N_FOR_VERDICT}"
+            return f"NO VERDICT -- {self.units} {self.unit_name}, need {self.min_n}"
         if self.distinguishable:
             return "DISTINGUISHABLE from zero"
         return "NOT distinguishable from zero"
 
 
-def expectancy(pnl: list[float]) -> Expectancy:
-    """Per-unit expectancy with a t-interval sized for the sample actually held."""
+def _group(pnl: list[float], clusters: list[str | None]) -> dict[str, list[float]]:
+    """Trades by cluster. A trade with no cluster is its own cluster: that is
+    the honest reading of "we do not know what this shares an outcome with"."""
+    if len(clusters) != len(pnl):
+        raise ValueError("clusters must align with pnl")
+    out: dict[str, list[float]] = {}
+    for i, (x, c) in enumerate(zip(pnl, clusters, strict=True)):
+        out.setdefault(c if c is not None else f"\x00{i}", []).append(x)
+    return out
+
+
+def expectancy(
+    pnl: list[float],
+    clusters: list[str | None] | None = None,
+    min_n: int | None = None,
+) -> Expectancy:
+    """Per-unit expectancy with an interval sized for the sample actually held.
+
+    Unclustered: Student's t on n-1 degrees of freedom.
+
+    Clustered: the CR1 cluster-robust variance of the mean,
+        Var(mean) = G/(G-1) * sum_g (sum_{i in g} (x_i - mean))^2 / n^2
+    on G-1 degrees of freedom. Trades inside a cluster can be as correlated as
+    they like; only the number of clusters buys precision. The default verdict
+    threshold drops to MIN_CLUSTERS_FOR_VERDICT because a cluster is a bigger
+    unit of evidence than a trade -- but it is still a floor, not a target.
+    """
     n = len(pnl)
     if n == 0:
-        return Expectancy(0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+        return Expectancy(0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                          clusters=0 if clusters is not None else None,
+                          min_n=min_n or MIN_N_FOR_VERDICT)
     total = sum(pnl)
     m, sd = mean_sd(pnl)
-    se = sd / math.sqrt(n) if n > 1 and sd > 0 else 0.0
-    crit = t95(n - 1)
+
+    if clusters is None:
+        se = sd / math.sqrt(n) if n > 1 and sd > 0 else 0.0
+        crit = t95(n - 1)
+        lo, hi = (m - crit * se, m + crit * se) if se else (m, m)
+        return Expectancy(n=n, total=total, mean=m, sd=sd, se=se, lo=lo, hi=hi,
+                          min_n=min_n or MIN_N_FOR_VERDICT)
+
+    groups = _group(pnl, clusters)
+    g = len(groups)
+    if g > 1:
+        var = (g / (g - 1)) * sum(sum(x - m for x in xs) ** 2 for xs in groups.values()) / n ** 2
+        se = math.sqrt(var) if var > 0 else 0.0
+    else:
+        se = 0.0
+    crit = t95(g - 1)
     lo, hi = (m - crit * se, m + crit * se) if se else (m, m)
-    return Expectancy(n=n, total=total, mean=m, sd=sd, se=se, lo=lo, hi=hi)
+    return Expectancy(n=n, total=total, mean=m, sd=sd, se=se, lo=lo, hi=hi,
+                      clusters=g, min_n=min_n or MIN_CLUSTERS_FOR_VERDICT)
+
+
+def block_bootstrap(
+    pnl: list[float],
+    clusters: list[str | None] | None = None,
+    reps: int = 2000,
+    seed: int = 0,
+) -> tuple[float, float] | None:
+    """95% percentile interval for the mean, resampling whole clusters.
+
+    Resampling clusters rather than trades keeps whatever dependence exists
+    inside a cluster intact. With no clusters every trade is its own block and
+    this is the ordinary bootstrap. Seeded, so two runs on the same file agree.
+    Returns None when there is nothing to resample from.
+    """
+    n = len(pnl)
+    if n < 2:
+        return None
+    blocks = list(_group(pnl, clusters).values()) if clusters is not None else [[x] for x in pnl]
+    if len(blocks) < 2:
+        return None
+    rng = random.Random(seed)
+    sums = [sum(b) for b in blocks]
+    sizes = [len(b) for b in blocks]
+    k = len(blocks)
+    means: list[float] = []
+    for _ in range(reps):
+        tot = 0.0
+        cnt = 0
+        for _ in range(k):
+            j = rng.randrange(k)
+            tot += sums[j]
+            cnt += sizes[j]
+        means.append(tot / cnt)
+    means.sort()
+    lo_i = int(math.floor(0.025 * (reps - 1)))
+    hi_i = int(math.ceil(0.975 * (reps - 1)))
+    return means[lo_i], means[hi_i]
+
+
+def z_to_p(z: float) -> float:
+    """Two-sided p-value of a standard-normal z."""
+    return math.erfc(abs(z) / math.sqrt(2.0))
+
+
+def holm(pvalues: list[float]) -> list[float]:
+    """Holm step-down adjusted p-values, in the input order.
+
+    Looking at five buckets and reporting the worst is five tests, not one; the
+    chance that *some* bucket clears |z| >= 2 by luck alone is far above 5%.
+    Holm controls the family-wise error rate without Bonferroni's full penalty.
+    """
+    m = len(pvalues)
+    if m == 0:
+        return []
+    order = sorted(range(m), key=lambda i: pvalues[i])
+    adjusted = [0.0] * m
+    running = 0.0
+    for rank, i in enumerate(order):
+        p = min(1.0, (m - rank) * pvalues[i])
+        running = max(running, p)          # enforce monotonicity
+        adjusted[i] = running
+    return adjusted
 
 
 def binomial_z(predicted: float, actual: float, n: int) -> float | None:
@@ -128,7 +256,12 @@ def required_n(effect: float, sd: float, floor: int = MIN_N_FOR_VERDICT) -> int 
     """
     if sd <= 0 or abs(effect) < 1e-12:
         return None
+    # The interval above uses t, so the sizing does too: start from the normal
+    # answer and re-solve once with the t critical value at that n. One pass
+    # converges to within a trade for every n this tool will render.
     n = ((Z95 + Z80) ** 2) * (sd ** 2) / (effect ** 2)
+    crit = t95(max(1, int(math.ceil(n)) - 1))
+    n = ((crit + Z80) ** 2) * (sd ** 2) / (effect ** 2)
     return max(int(math.ceil(n)), floor)
 
 
