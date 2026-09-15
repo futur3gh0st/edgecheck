@@ -6,7 +6,7 @@ import json
 
 import pytest
 
-from edgecheck.loaders import ColumnMap, load, read_rows
+from edgecheck.loaders import ColumnMap, load, parse_time, read_rows
 
 
 def _csv(tmp_path, header, rows, name="t.csv"):
@@ -137,3 +137,67 @@ def test_paired_needs_a_kind_column():
     m = ColumnMap(key="id", entry_kind="open", resolve_kind="settle")
     assert not m.paired
     assert ColumnMap(key="id", kind="kind", entry_kind="open", resolve_kind="settle").paired
+
+
+# ---- time, cluster, capacity columns ---------------------------------------
+
+@pytest.mark.parametrize("raw,expected", [
+    ("2026-09-14T15:32:00Z", 1789399920.0),
+    ("2026-09-14T15:32:00+00:00", 1789399920.0),
+    ("2026-09-14 15:32:00", 1789399920.0),          # naive -> UTC
+    ("1789399920", 1789399920.0),                    # epoch seconds
+    ("1789399920000", 1789399920.0),                 # epoch milliseconds
+    ("not a time", None),
+    ("", None),
+])
+def test_parse_time_reads_the_shapes_logs_actually_use(raw, expected):
+    assert parse_time(raw) == expected
+
+
+def test_trades_come_back_in_entry_order_when_timed(tmp_path):
+    """Drawdown and gap detection are meaningless on file order."""
+    p = _csv(tmp_path, ["pnl", "ts"], [[3.0, "2026-01-03"], [1.0, "2026-01-01"], [2.0, "2026-01-02"]])
+    assert [t.pnl for t in load(p, ColumnMap(time="ts"))] == [1.0, 2.0, 3.0]
+
+
+def test_unreadable_times_are_kept_last_not_dropped(tmp_path):
+    p = _csv(tmp_path, ["pnl", "ts"], [[2.0, "2026-01-02"], [9.0, "junk"], [1.0, "2026-01-01"]])
+    ts = load(p, ColumnMap(time="ts"))
+    assert [t.pnl for t in ts] == [1.0, 2.0, 9.0]
+    assert ts[-1].time is None
+
+
+def test_auto_cluster_is_the_utc_day(tmp_path):
+    p = _csv(tmp_path, ["pnl", "ts"], [
+        [1.0, "2026-01-01T23:59:00Z"], [1.0, "2026-01-02T00:01:00Z"], [1.0, "2026-01-02T12:00:00Z"],
+    ])
+    ts = load(p, ColumnMap(time="ts", cluster="auto"))
+    assert [t.cluster for t in ts] == ["2026-01-01", "2026-01-02", "2026-01-02"]
+
+
+def test_auto_cluster_without_time_is_none(tmp_path):
+    p = _csv(tmp_path, ["pnl"], [[1.0]])
+    assert load(p, ColumnMap(cluster="auto"))[0].cluster is None
+
+
+def test_named_cluster_column_is_read_as_text(tmp_path):
+    p = _csv(tmp_path, ["pnl", "sess"], [[1.0, 7], [1.0, "7"], [1.0, ""]])
+    assert [t.cluster for t in load(p, ColumnMap(cluster="sess"))] == ["7", "7", None]
+
+
+def test_time_comes_from_the_entry_row_in_a_paired_log(tmp_path):
+    """The decision was made at entry; settlement time is when the world
+    caught up, and clustering by it would group unrelated decisions."""
+    p = tmp_path / "live.jsonl"
+    p.write_text("\n".join(json.dumps(r) for r in [
+        {"kind": "open", "id": "A", "ts": "2026-01-01T10:00:00Z"},
+        {"kind": "settle", "id": "A", "pnl": 1.0, "ts": "2026-01-01T18:00:00Z"},
+    ]) + "\n")
+    m = ColumnMap(kind="kind", entry_kind="open", resolve_kind="settle", key="id", time="ts")
+    assert load(p, m)[0].time == parse_time("2026-01-01T10:00:00Z")
+
+
+def test_fill_size_and_depth_are_read(tmp_path):
+    p = _csv(tmp_path, ["pnl", "size", "filled", "depth"], [[1.0, 15, 2, 2.5]])
+    t = load(p, ColumnMap(size="size", fill_size="filled", depth="depth"))[0]
+    assert (t.size, t.fill_size, t.depth) == (15.0, 2.0, 2.5)
