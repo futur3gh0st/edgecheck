@@ -129,3 +129,11 @@ def test_read_rows_on_an_empty_file(tmp_path):
     p = tmp_path / "empty.csv"
     p.write_text("")
     assert read_rows(p) == []
+
+
+def test_paired_needs_a_kind_column():
+    """key + entry_kind + resolve_kind without kind used to count as paired and
+    then look every row up under a None column."""
+    m = ColumnMap(key="id", entry_kind="open", resolve_kind="settle")
+    assert not m.paired
+    assert ColumnMap(key="id", kind="kind", entry_kind="open", resolve_kind="settle").paired

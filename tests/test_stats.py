@@ -8,11 +8,15 @@ import pytest
 
 from edgecheck.stats import (
     MIN_N_FOR_VERDICT,
+    SIGNIFICANT_Z,
     Z95,
+    Bucket,
+    binomial_z,
     bucket_by,
     expectancy,
     mean_sd,
     required_n,
+    sum_z,
     t95,
 )
 
@@ -101,3 +105,31 @@ def test_every_row_lands_in_exactly_one_bucket(n, nb):
     bs = bucket_by(rows, n_buckets=nb)
     assert sum(b.n for b in bs) == n
     assert bs, "a non-empty input must always yield at least one bucket"
+
+
+def test_a_small_gap_on_a_small_bucket_is_not_significant():
+    """86.4% predicted, 83.8% won, n=80: -2.7 points but z=-0.68. Calling that
+    'overconfident' is the overclaim the tool exists to refuse."""
+    b = Bucket(key=0.864, predicted=0.864, actual=0.838, n=80, total_pnl=0.0)
+    assert b.z == pytest.approx(-0.68, abs=0.01)
+    assert not b.significant
+
+
+def test_the_same_gap_on_a_large_bucket_is_significant():
+    b = Bucket(key=0.864, predicted=0.864, actual=0.838, n=2000, total_pnl=0.0)
+    assert b.z is not None and b.z < -SIGNIFICANT_Z
+    assert b.significant
+
+
+def test_binomial_z_refuses_a_degenerate_null():
+    assert binomial_z(1.0, 0.9, 50) is None
+    assert binomial_z(0.0, 0.1, 50) is None
+    assert binomial_z(0.5, 0.6, 0) is None
+
+
+def test_sum_z_scales_with_root_n():
+    """A bucket total of -38.71 over 80 trades with per-trade sd 5.44 is under
+    one standard error from zero, not a concentrated loss."""
+    assert sum_z(-38.71, 5.4358, 80) == pytest.approx(-0.80, abs=0.01)
+    assert sum_z(-38.71, 5.4358, 8000) == pytest.approx(-0.08, abs=0.01)
+    assert sum_z(1.0, 0.0, 10) is None

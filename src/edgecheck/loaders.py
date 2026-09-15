@@ -64,7 +64,7 @@ class ColumnMap:
 
     @property
     def paired(self) -> bool:
-        return bool(self.key and self.entry_kind and self.resolve_kind)
+        return bool(self.key and self.kind and self.entry_kind and self.resolve_kind)
 
 
 @dataclass
@@ -195,15 +195,18 @@ def _load_paired(rows: list[dict[str, Any]], m: ColumnMap) -> list[Trade]:
     to the first entry with that key would silently reuse one entry's claimed
     edge for several outcomes.
     """
+    kind, key = m.kind, m.key
+    if not (kind and key):
+        raise ValueError("paired loading needs both `kind` and `key` columns")
     pending: dict[str, list[dict[str, Any]]] = {}
     for r in rows:
-        if str(r.get(m.kind)) == m.entry_kind:
-            pending.setdefault(str(r.get(m.key)), []).append(r)
+        if str(r.get(kind)) == m.entry_kind:
+            pending.setdefault(str(r.get(key)), []).append(r)
     out = []
     for r in rows:
-        if str(r.get(m.kind)) != m.resolve_kind:
+        if str(r.get(kind)) != m.resolve_kind:
             continue
-        queue = pending.get(str(r.get(m.key)))
+        queue = pending.get(str(r.get(key)))
         if not queue:
             continue
         entry = queue.pop(0)

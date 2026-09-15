@@ -21,6 +21,9 @@ examples:
   # find out whether the loss lives in one slice
   edgecheck trades.csv --pnl pnl --by minutes_left
 
+  # no claimed-edge column: name the edge you want the run sized to detect
+  edgecheck trades.csv --pnl pnl --target 0.05
+
   # a live log that appends an entry row and a resolve row separately
   edgecheck live.jsonl --pnl pnl_after_fee --kind kind \\
       --entry-kind open --resolve-kind settle --key ticker
@@ -61,14 +64,22 @@ def build_parser() -> argparse.ArgumentParser:
     o = p.add_argument_group("analysis")
     o.add_argument("--by", metavar="COLUMN", help="also split results by a numeric column")
     o.add_argument("--buckets", type=int, default=5, help="buckets per split (default 5)")
+    o.add_argument("--target", type=float, metavar="EDGE",
+                   help="per-trade edge to size the power analysis for, when no "
+                        "--claimed column is logged")
     o.add_argument("--unit-cost", type=float,
-                   help="cost per unit, to compare against edge per unit")
+                   help="cost per unit, to compare against edge per unit "
+                        "(requires --won and --price)")
     o.add_argument("--unit", default="contract", help="name of the unit (default: contract)")
     return p
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.unit_cost is not None and not (args.won and args.price):
+        parser.error("--unit-cost needs --won (for the realised win rate) "
+                     "and --price (for the breakeven)")
     if not args.path.exists():
         print(f"no such file: {args.path}", file=sys.stderr)
         return 2
@@ -88,14 +99,18 @@ def main(argv: list[str] | None = None) -> int:
 
     ue = None
     if args.unit_cost is not None:
-        wins = [t for t in trades if t.won]
-        prices = [t.price for t in trades if t.price is not None]
-        if prices:
-            ue = unit_economics(len(wins) / len(trades),
-                                sum(prices) / len(prices),
-                                args.unit_cost, args.unit)
+        scored = [t for t in trades if t.won is not None and t.price is not None]
+        if not scored:
+            print(f"  --unit-cost: no rows carry both '{args.won}' and '{args.price}'.",
+                  file=sys.stderr)
+            return 1
+        prices = [t.price for t in scored if t.price is not None]
+        ue = unit_economics(sum(1 for t in scored if t.won) / len(scored),
+                            sum(prices) / len(prices),
+                            args.unit_cost, args.unit)
 
-    print(render(trades, split_by=args.by, unit_econ=ue, buckets=args.buckets))
+    print(render(trades, split_by=args.by, unit_econ=ue, buckets=args.buckets,
+                 target=args.target))
     return 0
 
 

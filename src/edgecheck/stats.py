@@ -21,6 +21,13 @@ Z80 = 0.8416212336    # 80% power
 # three lucky coin flips significant.
 MIN_N_FOR_VERDICT = 30
 
+# A bucket-level warning (overconfident, concentrated loss) is only raised when
+# the bucket sits at least this many standard errors from its null. Below it
+# the deviation is reported as noise, because at n=80 a 2.7-point calibration
+# gap is inside one binomial SE and flagging it would be the exact overclaim
+# this tool exists to prevent.
+SIGNIFICANT_Z = 2.0
+
 # Student's t, two-sided 95%, by degrees of freedom. Using the normal 1.96 at
 # small n understates the interval badly: at n=3 the true multiplier is 4.30.
 _T95 = {1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571, 6: 2.447, 7: 2.365,
@@ -95,6 +102,23 @@ def expectancy(pnl: list[float]) -> Expectancy:
     return Expectancy(n=n, total=total, mean=m, sd=sd, se=se, lo=lo, hi=hi)
 
 
+def binomial_z(predicted: float, actual: float, n: int) -> float | None:
+    """How many standard errors `actual` sits from `predicted`, for a win rate
+    observed over n trials whose null probability is `predicted`."""
+    if n <= 0 or predicted <= 0.0 or predicted >= 1.0:
+        return None
+    se = math.sqrt(predicted * (1.0 - predicted) / n)
+    return (actual - predicted) / se
+
+
+def sum_z(total: float, sd: float, n: int) -> float | None:
+    """How many standard errors a bucket's summed P&L sits from zero, given the
+    per-trade standard deviation of the whole sample."""
+    if n <= 0 or sd <= 0.0:
+        return None
+    return total / (sd * math.sqrt(n))
+
+
 def required_n(effect: float, sd: float, floor: int = MIN_N_FOR_VERDICT) -> int | None:
     """Resolved trades needed to detect `effect` at 95% confidence, 80% power.
 
@@ -122,6 +146,16 @@ class Bucket:
     def gap(self) -> float:
         """Realised minus predicted. Negative means overconfident."""
         return self.actual - self.predicted
+
+    @property
+    def z(self) -> float | None:
+        """Gap in binomial standard errors, taking the model's own probability
+        as the null. None when the null is degenerate (p of 0 or 1) or n is 0."""
+        return binomial_z(self.predicted, self.actual, self.n)
+
+    @property
+    def significant(self) -> bool:
+        return self.z is not None and abs(self.z) >= SIGNIFICANT_Z
 
 
 def bucket_by(

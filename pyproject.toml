@@ -20,7 +20,7 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "ruff>=0.16"]
+dev = ["pytest>=8.0", "ruff>=0.16", "mypy>=1.10"]
 
 [project.scripts]
 edgecheck = "edgecheck.cli:main"
@@ -37,3 +37,7 @@ line-length = 100
 
 [tool.ruff.lint]
 select = ["F", "E9", "B", "DTZ", "PLE", "I"]
+
+[tool.mypy]
+strict = true
+files = ["src/edgecheck"]
