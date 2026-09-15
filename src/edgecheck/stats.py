@@ -112,7 +112,7 @@ class Expectancy:
         return "NOT distinguishable from zero"
 
 
-def _group(pnl: list[float], clusters: list[str | None]) -> dict[str, list[float]]:
+def group_by_cluster(pnl: list[float], clusters: list[str | None]) -> dict[str, list[float]]:
     """Trades by cluster. A trade with no cluster is its own cluster: that is
     the honest reading of "we do not know what this shares an outcome with"."""
     if len(clusters) != len(pnl):
@@ -154,7 +154,7 @@ def expectancy(
         return Expectancy(n=n, total=total, mean=m, sd=sd, se=se, lo=lo, hi=hi,
                           min_n=min_n or MIN_N_FOR_VERDICT)
 
-    groups = _group(pnl, clusters)
+    groups = group_by_cluster(pnl, clusters)
     g = len(groups)
     if g > 1:
         var = (g / (g - 1)) * sum(sum(x - m for x in xs) ** 2 for xs in groups.values()) / n ** 2
@@ -183,7 +183,7 @@ def block_bootstrap(
     n = len(pnl)
     if n < 2:
         return None
-    blocks = list(_group(pnl, clusters).values()) if clusters is not None else [[x] for x in pnl]
+    blocks = list(group_by_cluster(pnl, clusters).values()) if clusters is not None else [[x] for x in pnl]
     if len(blocks) < 2:
         return None
     rng = random.Random(seed)
