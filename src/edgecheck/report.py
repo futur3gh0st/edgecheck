@@ -238,7 +238,7 @@ def expectancy_section(e: Expectancy, naive: Expectancy | None,
         df = (e.clusters - 1) if e.clusters is not None else (e.n - 1)
         kind = "cluster-robust" if e.clusters is not None else "t"
         label = f"95% CI ({kind}, df={df})"
-        out.append(f"  {label:<22}[{e.lo:+.4f}, {e.hi:+.4f}]")
+        out.append(f"  {label:<{max(22, len(label) + 2)}}[{e.lo:+.4f}, {e.hi:+.4f}]")
     if naive is not None and naive.se:
         out.append(f"  naive per-trade CI    [{naive.lo:+.4f}, {naive.hi:+.4f}]"
                    "   (what 0.1 would have printed)")
